@@ -9,8 +9,7 @@ const CONNECT_TIMEOUT_MS = 1500;
 const FALLBACK_TIMEOUT_MS = 1200;
 const DOH_TIMEOUT_MS = 1500;
 const PARALLEL_DIALS = 2;
-const READ_CHUNK_SIZE = 65536;
-const MUX_CHUNK_SIZE = 32768;
+const MUX_CHUNK_SIZE = 65500;
 const MAX_FRAME = 1 << 20;
 const MAX_REPLAY_BYTES = 65536;
 const MAX_MUX_PENDING_BYTES = 2 * 1024 * 1024;
@@ -563,39 +562,75 @@ const openProxyFallback = async (fallbackPort) => {
   throw new Error('Proxy failed');
 };
 
-const tunnel = async (request, writable, earlyData) => {
-  const out = writable.getWriter();
+const createGrpcResponseStream = (onCancel) => {
+  let ctrl;
+  let closed = false;
+  let pullPromise = null;
+  let pullResolve = null;
+
+  const wakePull = () => {
+    if (pullResolve) {
+      const r = pullResolve;
+      pullResolve = null;
+      pullPromise = null;
+      r();
+    }
+  };
+
+  const readable = new ReadableStream(
+    {
+      start(c) {
+        ctrl = c;
+      },
+      pull() {
+        wakePull();
+      },
+      cancel() {
+        closed = true;
+        wakePull();
+        if (onCancel) onCancel();
+      },
+    },
+    { highWaterMark: 4 }
+  );
+
+  return {
+    readable,
+    isClosed: () => closed,
+    waitReady: () => {
+      if (closed || ctrl.desiredSize === null || ctrl.desiredSize > 0) return null;
+      if (!pullPromise) {
+        pullPromise = new Promise((r) => {
+          pullResolve = r;
+        });
+      }
+      return pullPromise;
+    },
+    enqueue: (chunk) => {
+      if (!closed) ctrl.enqueue(chunk);
+    },
+    close: () => {
+      if (closed) return;
+      closed = true;
+      wakePull();
+      try {
+        ctrl.close();
+      } catch {}
+    },
+    abort: (err) => {
+      if (closed) return;
+      closed = true;
+      wakePull();
+      try {
+        ctrl.error(err);
+      } catch {}
+    },
+  };
+};
+
+const tunnel = async (request, streamOut, earlyData, state) => {
   const reader = request.body.getReader();
   const stopReader = () => reader.cancel().catch(() => {});
-
-  let outFinished = false;
-  const closeOut = async () => {
-    if (outFinished) return;
-    outFinished = true;
-    await out.close();
-  };
-  const abortOut = async (err) => {
-    if (outFinished) return;
-    outFinished = true;
-    await out.abort(err);
-  };
-
-  const state = {
-    socket: null,
-    sink: null,
-    downlink: null,
-    header: null,
-    port: 0,
-    allowRetry: false,
-    isMux: false,
-    hasData: false,
-    fallbackUsed: false,
-    fallbackPromise: null,
-    replayChunks: [],
-    replayBytes: 0,
-    replayedCount: 0,
-    closed: false,
-  };
 
   let head = null;
   let grpcBuf = null;
@@ -603,7 +638,7 @@ const tunnel = async (request, writable, earlyData) => {
   let headerBuf = EMPTY;
   let muxBuf = null;
   let muxLen = 0;
-  const muxSessions = new Map();
+  const muxSessions = state.muxSessions;
 
   let pendingMuxBytes = 0;
   let muxDrainResolve = null;
@@ -621,22 +656,22 @@ const tunnel = async (request, writable, earlyData) => {
           muxDrainResolve = resolve;
         });
 
-  const writeGrpc = (data) => {
+  const emitGrpc = (data) => {
     let h = null;
     if (head) {
       h = head;
       head = null;
     }
-    return out.write(encodeFrame(data, h));
+    streamOut.enqueue(encodeFrame(data, h));
   };
 
-  const writeMux = (sessionId, status, option, data) => {
+  const emitMux = (sessionId, status, option, data) => {
     let h = null;
     if (head) {
       h = head;
       head = null;
     }
-    return out.write(encodeGrpcMuxFrame(sessionId, status, option, data, h));
+    streamOut.enqueue(encodeGrpcMuxFrame(sessionId, status, option, data, h));
   };
 
   const saveReplay = (target, chunk) => {
@@ -647,60 +682,36 @@ const tunnel = async (request, writable, earlyData) => {
   };
 
   const pipeSocket = async (socket, sess, isMuxSession) => {
-    const chunkLimit = isMuxSession ? MUX_CHUNK_SIZE : READ_CHUNK_SIZE;
-    let sockReader;
-    let byob = false;
+    const sockReader = socket.readable.getReader();
     try {
-      sockReader = socket.readable.getReader({ mode: 'byob' });
-      byob = true;
-    } catch {
-      sockReader = socket.readable.getReader();
-    }
+      for (;;) {
+        const w = streamOut.waitReady();
+        if (w) await w;
+        if (streamOut.isClosed() || state.closed || sess.closed) break;
 
-    try {
-      if (byob) {
-        let readBuf = new ArrayBuffer(chunkLimit);
-        for (;;) {
-          if (out.desiredSize !== null && out.desiredSize <= 0) {
-            await out.ready;
-          }
-          const { done, value } = await sockReader.read(new Uint8Array(readBuf, 0, chunkLimit));
-          if (done) break;
-          if (!value || !value.byteLength) {
-            if (value && value.buffer.byteLength >= chunkLimit) readBuf = value.buffer;
-            continue;
-          }
-          sess.hasData = true;
-          sess.replayChunks = null;
-          let h = null;
-          if (head) {
-            h = head;
-            head = null;
-          }
-          const frame = isMuxSession
-            ? encodeGrpcMuxFrame(sess.id, 2, 1, value, h)
-            : encodeFrame(value, h);
-          readBuf = value.buffer.byteLength >= chunkLimit ? value.buffer : new ArrayBuffer(chunkLimit);
-          await out.write(frame);
-        }
-      } else {
-        for (;;) {
-          const { done, value } = await sockReader.read();
-          if (done) break;
-          if (!value || !value.byteLength) continue;
-          sess.hasData = true;
-          sess.replayChunks = null;
+        const { done, value } = await sockReader.read();
+        if (done) break;
+        if (!value || !value.byteLength) continue;
+
+        sess.hasData = true;
+        sess.replayChunks = null;
+
+        if (!isMuxSession) {
+          emitGrpc(value);
+        } else {
           const len = value.byteLength;
-          for (let off = 0; off < len; off += chunkLimit) {
-            const end = off + chunkLimit < len ? off + chunkLimit : len;
-            const slice = off === 0 && end === len ? value : value.subarray(off, end);
-            if (isMuxSession) await writeMux(sess.id, 2, 1, slice);
-            else await writeGrpc(slice);
+          if (len <= MUX_CHUNK_SIZE) {
+            emitMux(sess.id, 2, 1, value);
+          } else {
+            for (let off = 0; off < len; off += MUX_CHUNK_SIZE) {
+              const end = off + MUX_CHUNK_SIZE < len ? off + MUX_CHUNK_SIZE : len;
+              emitMux(sess.id, 2, 1, value.subarray(off, end));
+            }
           }
         }
       }
 
-      if (!sess.hasData && sess.allowRetry && TARGET_HOST && !sess.fallbackUsed && !state.closed && !sess.closed) {
+      if (!sess.hasData && sess.allowRetry && TARGET_HOST && !sess.fallbackUsed && !state.closed && !sess.closed && !streamOut.isClosed()) {
         try {
           sockReader.releaseLock();
         } catch {}
@@ -713,13 +724,13 @@ const tunnel = async (request, writable, earlyData) => {
 
       if (isMuxSession) {
         muxSessions.delete(sess.id);
-        await writeMux(sess.id, 3, 0, null);
+        emitMux(sess.id, 3, 0, null);
       } else {
-        if (head) await writeGrpc(EMPTY);
-        await closeOut();
+        if (head) emitGrpc(EMPTY);
+        streamOut.close();
       }
     } catch (err) {
-      if (!sess.hasData && sess.allowRetry && TARGET_HOST && !sess.fallbackUsed && !state.closed && !sess.closed) {
+      if (!sess.hasData && sess.allowRetry && TARGET_HOST && !sess.fallbackUsed && !state.closed && !sess.closed && !streamOut.isClosed()) {
         try {
           sockReader.releaseLock();
         } catch {}
@@ -733,11 +744,9 @@ const tunnel = async (request, writable, earlyData) => {
       }
       if (isMuxSession) {
         muxSessions.delete(sess.id);
-        writeMux(sess.id, 3, 2, null).catch(() => {});
+        emitMux(sess.id, 3, 2, null);
       } else {
-        try {
-          await abortOut(err);
-        } catch {}
+        streamOut.abort(err);
       }
     } finally {
       try {
@@ -841,7 +850,9 @@ const tunnel = async (request, writable, earlyData) => {
                     dnsCacheSet(qKey, pkt);
                   }
                 }
-                await writeMux(id, 2, 1, pkt);
+                const w = streamOut.waitReady();
+                if (w) await w;
+                emitMux(id, 2, 1, pkt);
               }
               if (doff < total) {
                 const rem = total - doff;
@@ -857,10 +868,10 @@ const tunnel = async (request, writable, earlyData) => {
               }
             }
             muxSessions.delete(id);
-            await writeMux(id, 3, 0, null);
+            emitMux(id, 3, 0, null);
           } catch {
             muxSessions.delete(id);
-            writeMux(id, 3, 2, null).catch(() => {});
+            emitMux(id, 3, 2, null);
           } finally {
             try {
               r.releaseLock();
@@ -875,10 +886,9 @@ const tunnel = async (request, writable, earlyData) => {
         if (!pkt.byteLength || sess.closed) return;
         const cached = dnsCacheGet(pkt);
         if (cached) {
-          sess.writeChain = sess.writeChain.then(() => writeMux(id, 2, 1, cached));
+          sess.writeChain = sess.writeChain.then(() => emitMux(id, 2, 1, cached));
           return;
         }
-        // Build framed DNS packet synchronously before muxBuf may be compacted
         const outPkt = new Uint8Array(2 + pkt.byteLength);
         outPkt[0] = pkt.byteLength >>> 8;
         outPkt[1] = pkt.byteLength;
@@ -908,7 +918,7 @@ const tunnel = async (request, writable, earlyData) => {
             } catch {}
           } else {
             muxSessions.delete(id);
-            await writeMux(id, 3, 0, null);
+            emitMux(id, 3, 0, null);
           }
         }).catch(() => sess.abort());
       },
@@ -919,7 +929,7 @@ const tunnel = async (request, writable, earlyData) => {
         try {
           sess.socket?.close();
         } catch {}
-        writeMux(id, 3, 2, null).catch(() => {});
+        emitMux(id, 3, 2, null);
       },
     };
     muxSessions.set(id, sess);
@@ -1032,7 +1042,7 @@ const tunnel = async (request, writable, earlyData) => {
         try {
           sess.socket?.close();
         } catch {}
-        writeMux(id, 3, 2, null).catch(() => {});
+        emitMux(id, 3, 2, null);
       },
     };
 
@@ -1116,7 +1126,7 @@ const tunnel = async (request, writable, earlyData) => {
       if (status === 1) {
         const target = parseMuxTarget(src, m + 4, metaEnd);
         if (!target || (target.net === 2 && target.port !== 53)) {
-          writeMux(id, 3, 2, null).catch(() => {});
+          emitMux(id, 3, 2, null);
           continue;
         }
         const existing = muxSessions.get(id);
@@ -1223,6 +1233,20 @@ const tunnel = async (request, writable, earlyData) => {
     }
   };
 
+  state.cancel = () => {
+    state.closed = true;
+    stopReader();
+    for (const sess of muxSessions.values()) {
+      try {
+        sess.socket?.close();
+      } catch {}
+    }
+    muxSessions.clear();
+    try {
+      state.socket?.close();
+    } catch {}
+  };
+
   try {
     if (earlyData) {
       await initConnection(earlyData);
@@ -1230,6 +1254,7 @@ const tunnel = async (request, writable, earlyData) => {
     for (;;) {
       const drainWait = waitMuxDrain();
       if (drainWait) await drainWait;
+      if (state.closed || streamOut.isClosed()) break;
 
       const { done, value } = await reader.read();
       if (done) break;
@@ -1270,7 +1295,7 @@ const tunnel = async (request, writable, earlyData) => {
             shift += 7;
             if (shift > 28) throw new Error('bad message');
           }
-          if (i + n > msgEnd) throw new Error('bad message');
+          if (n < 0 || i + n > msgEnd) throw new Error('bad message');
           if (tag === 10) {
             const data = src.subarray(i, i + n);
             if (!state.header) {
@@ -1311,8 +1336,8 @@ const tunnel = async (request, writable, earlyData) => {
           if (active[i].downlink === p) break;
         }
       }
-      if (head) await writeGrpc(EMPTY);
-      await closeOut();
+      if (head) emitGrpc(EMPTY);
+      streamOut.close();
     } else {
       if (state.fallbackPromise) await state.fallbackPromise;
       if (state.sink) {
@@ -1323,23 +1348,12 @@ const tunnel = async (request, writable, earlyData) => {
           if (state.downlink === p) break;
         }
       } else {
-        await closeOut();
+        streamOut.close();
       }
     }
   } catch (err) {
-    state.closed = true;
-    for (const sess of muxSessions.values()) {
-      try {
-        sess.socket?.close();
-      } catch {}
-    }
-    muxSessions.clear();
-    try {
-      state.socket?.close();
-    } catch {}
-    try {
-      await abortOut(err);
-    } catch {}
+    state.cancel();
+    streamOut.abort(err);
   }
 };
 
@@ -1354,9 +1368,27 @@ export default {
       const ct = request.headers.get('content-type');
       if (ct && ct.length >= 16 && ct.slice(0, 16).toLowerCase() === 'application/grpc') {
         const earlyData = decodeEarlyData(request);
-        const { readable, writable } = new TransformStream();
-        ctx.waitUntil(tunnel(request, writable, earlyData));
-        return new Response(readable, { headers: GRPC_HEADERS });
+        const state = {
+          socket: null,
+          sink: null,
+          downlink: null,
+          header: null,
+          port: 0,
+          allowRetry: false,
+          isMux: false,
+          hasData: false,
+          fallbackUsed: false,
+          fallbackPromise: null,
+          replayChunks: [],
+          replayBytes: 0,
+          replayedCount: 0,
+          closed: false,
+          muxSessions: new Map(),
+          cancel: null,
+        };
+        const streamOut = createGrpcResponseStream(() => state.cancel?.());
+        ctx.waitUntil(tunnel(request, streamOut, earlyData, state));
+        return new Response(streamOut.readable, { headers: GRPC_HEADERS });
       }
     }
 
