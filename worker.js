@@ -10,11 +10,15 @@ const FALLBACK_TIMEOUT_MS = 1200;
 const DOH_TIMEOUT_MS = 1500;
 const PARALLEL_DIALS = 3;
 const READ_CHUNK_SIZE = 65536;
+const MUX_CHUNK_SIZE = 32768;
 const MAX_FRAME = 1 << 20;
 const MAX_REPLAY_BYTES = 65536;
 const EARLY_DATA_MAX_BYTES = 8192;
 const EARLY_DATA_MAX_B64 = Math.ceil((EARLY_DATA_MAX_BYTES * 4) / 3) + 4;
-const PROXY_CACHE_TTL_MS = 300000;
+const PROXY_CACHE_TTL_MS = 1800000;
+const BAD_TARGET_TTL_MS = 60000;
+const DNS_CACHE_TTL_MS = 60000;
+const DNS_CACHE_MAX = 256;
 
 const NGINX_BODY = new TextEncoder().encode(`<!DOCTYPE html>
 <html>
@@ -66,13 +70,15 @@ const NEED_MORE = { needMore: true };
 const decoder = new TextDecoder();
 
 const GRPC_HEADERS = { 'content-type': 'application/grpc', 'cache-control': 'no-store' };
-const HTML_HEADERS = { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' };
+const HTML_CACHE_HEADERS = { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'public, max-age=86400' };
 const DOH_HEADERS = { accept: 'application/dns-json' };
 
 let proxyCacheKey = '';
 let proxyCacheList = null;
 let proxyCacheAt = 0;
 let proxyIndex = 0;
+const badTargets = new Map();
+const dnsCache = new Map();
 
 const getPathname = (url) => {
   const s = url.indexOf('://');
@@ -156,6 +162,48 @@ const encodeFrame = (data, prefix) => {
   return out;
 };
 
+const encodeGrpcMuxFrame = (sessionId, status, option, data, prefix) => {
+  const dLen = data ? data.byteLength : 0;
+  const pLen = prefix ? prefix.byteLength : 0;
+  const n = pLen + 6 + (dLen ? 2 + dLen : 0);
+  let v = n;
+  let varintLen = 1;
+  while (v >= 128) {
+    v >>>= 7;
+    varintLen++;
+  }
+  const msgLen = 1 + varintLen + n;
+  const out = new Uint8Array(5 + msgLen);
+  out[1] = msgLen >>> 24;
+  out[2] = msgLen >>> 16;
+  out[3] = msgLen >>> 8;
+  out[4] = msgLen;
+  out[5] = 10;
+  let o = 6;
+  v = n;
+  while (v >= 128) {
+    out[o++] = (v & 127) | 128;
+    v >>>= 7;
+  }
+  out[o++] = v;
+  if (pLen) {
+    out.set(prefix, o);
+    o += pLen;
+  }
+  out[o++] = 0;
+  out[o++] = 4;
+  out[o++] = sessionId >>> 8;
+  out[o++] = sessionId;
+  out[o++] = status;
+  out[o++] = option;
+  if (dLen) {
+    out[o++] = dLen >>> 8;
+    out[o++] = dLen;
+    out.set(data, o);
+  }
+  return out;
+};
+
 const parseHeader = (d) => {
   const len = d.byteLength;
   if (len < 18) return NEED_MORE;
@@ -164,9 +212,13 @@ const parseHeader = (d) => {
   for (let i = 0; i < 16; i++) diff |= d[1 + i] ^ USER_ID[i];
   if (diff !== 0) return null;
   let p = 18 + d[17];
-  if (p + 4 > len) return NEED_MORE;
+  if (p + 1 > len) return NEED_MORE;
   const cmd = d[p];
+  if (cmd === 3) {
+    return { version: 0, cmd: 3, port: 0, host: '', offset: p + 1 };
+  }
   if (cmd !== 1 && cmd !== 2) return null;
+  if (p + 4 > len) return NEED_MORE;
   const port = (d[p + 1] << 8) | d[p + 2];
   if (cmd === 2 && port !== 53) return null;
   const type = d[p + 3];
@@ -201,6 +253,39 @@ const parseHeader = (d) => {
   return { version: 0, cmd, port, host, offset: p };
 };
 
+const parseMuxTarget = (buf, p, end) => {
+  if (p + 4 > end) return null;
+  const net = buf[p++];
+  if (net !== 1 && net !== 2) return null;
+  const port = (buf[p] << 8) | buf[p + 1];
+  p += 2;
+  const atype = buf[p++];
+  let host;
+  if (atype === 1) {
+    if (p + 4 > end) return null;
+    host = `${buf[p]}.${buf[p + 1]}.${buf[p + 2]}.${buf[p + 3]}`;
+  } else if (atype === 2) {
+    if (p + 1 > end) return null;
+    const hLen = buf[p++];
+    if (!hLen || p + hLen > end) return null;
+    host = decoder.decode(buf.subarray(p, p + hLen));
+  } else if (atype === 3) {
+    if (p + 16 > end) return null;
+    host =
+      ((buf[p] << 8) | buf[p + 1]).toString(16) + ':' +
+      ((buf[p + 2] << 8) | buf[p + 3]).toString(16) + ':' +
+      ((buf[p + 4] << 8) | buf[p + 5]).toString(16) + ':' +
+      ((buf[p + 6] << 8) | buf[p + 7]).toString(16) + ':' +
+      ((buf[p + 8] << 8) | buf[p + 9]).toString(16) + ':' +
+      ((buf[p + 10] << 8) | buf[p + 11]).toString(16) + ':' +
+      ((buf[p + 12] << 8) | buf[p + 13]).toString(16) + ':' +
+      ((buf[p + 14] << 8) | buf[p + 15]).toString(16);
+  } else {
+    return null;
+  }
+  return { net, port, host };
+};
+
 const decodeEarlyData = (request) => {
   const raw =
     request.headers.get('sec-websocket-protocol') ||
@@ -230,6 +315,38 @@ const decodeEarlyData = (request) => {
   if (!bytes.byteLength || bytes.byteLength > EARLY_DATA_MAX_BYTES) return null;
   const h = parseHeader(bytes);
   return h && !h.needMore ? bytes : null;
+};
+
+const dnsQueryKey = (pkt) => {
+  if (pkt.byteLength <= 12) return '';
+  let k = '';
+  for (let i = 2; i < pkt.byteLength; i++) k += String.fromCharCode(pkt[i]);
+  return k;
+};
+
+const dnsCacheGet = (pkt) => {
+  const key = dnsQueryKey(pkt);
+  if (!key) return null;
+  const entry = dnsCache.get(key);
+  if (!entry) return null;
+  if (Date.now() >= entry.expiresAt) {
+    dnsCache.delete(key);
+    return null;
+  }
+  const resp = entry.data.slice();
+  resp[0] = pkt[0];
+  resp[1] = pkt[1];
+  return resp;
+};
+
+const dnsCacheSet = (key, resp) => {
+  if (!key || resp.byteLength <= 12) return;
+  if ((resp[3] & 0x0f) !== 0 || ((resp[6] << 8) | resp[7]) === 0) return;
+  if (dnsCache.size >= DNS_CACHE_MAX) {
+    const first = dnsCache.keys().next().value;
+    if (first !== undefined) dnsCache.delete(first);
+  }
+  dnsCache.set(key, { data: resp.slice(), expiresAt: Date.now() + DNS_CACHE_TTL_MS });
 };
 
 const dohQuery = async (name, type) => {
@@ -360,13 +477,38 @@ const open = async (hostname, port, timeoutMs = CONNECT_TIMEOUT_MS) => {
 const openProxyFallback = async (fallbackPort) => {
   if (!TARGET_HOST) throw new Error('No fallback');
   const targets = await resolveProxyList(fallbackPort);
-  const len = targets.length;
-  for (let i = 0; i < len; i += PARALLEL_DIALS) {
+  const now = Date.now();
+  let healthy = [];
+  for (let i = 0; i < targets.length; i++) {
+    const idx = (proxyIndex + i) % targets.length;
+    const t = targets[idx];
+    const key = `${t[0]}:${t[1]}`;
+    const exp = badTargets.get(key);
+    if (!exp || now >= exp) {
+      if (exp) badTargets.delete(key);
+      healthy.push({ host: t[0], port: t[1], key, idx });
+    }
+  }
+  if (!healthy.length) {
+    badTargets.clear();
+    for (let i = 0; i < targets.length; i++) {
+      const idx = (proxyIndex + i) % targets.length;
+      const t = targets[idx];
+      healthy.push({ host: t[0], port: t[1], key: `${t[0]}:${t[1]}`, idx });
+    }
+  }
+
+  for (let i = 0; i < healthy.length; i += PARALLEL_DIALS) {
     const batch = [];
-    for (let j = 0; j < PARALLEL_DIALS && i + j < len; j++) {
-      const idx = (proxyIndex + i + j) % len;
+    for (let j = 0; j < PARALLEL_DIALS && i + j < healthy.length; j++) {
+      const item = healthy[i + j];
       batch.push(
-        open(targets[idx][0], targets[idx][1], FALLBACK_TIMEOUT_MS).then((sock) => ({ sock, idx }))
+        open(item.host, item.port, FALLBACK_TIMEOUT_MS)
+          .then((sock) => ({ sock, idx: item.idx }))
+          .catch((err) => {
+            badTargets.set(item.key, Date.now() + BAD_TARGET_TTL_MS);
+            throw err;
+          })
       );
     }
     try {
@@ -384,6 +526,7 @@ const openProxyFallback = async (fallbackPort) => {
       return winner.sock;
     } catch {}
   }
+
   proxyCacheAt = 0;
   throw new Error('Proxy failed');
 };
@@ -398,6 +541,7 @@ const tunnel = async (request, writable, earlyData) => {
     sink: null,
     downlink: null,
     header: null,
+    isMux: false,
     hasData: false,
     fallbackUsed: false,
     fallbackPromise: null,
@@ -407,17 +551,33 @@ const tunnel = async (request, writable, earlyData) => {
     closed: false,
   };
 
+  let head = null;
   let buf = EMPTY;
   let headerBuf = EMPTY;
+  let muxBuf = EMPTY;
+  const muxSessions = new Map();
 
-  const saveReplay = (chunk) => {
-    if (!state.replayChunks || state.hasData || state.fallbackUsed || !chunk.byteLength) return -1;
-    if (state.replayBytes + chunk.byteLength > MAX_REPLAY_BYTES) return -1;
-    state.replayBytes += chunk.byteLength;
-    return state.replayChunks.push(chunk.slice()) - 1;
+  const writeGrpc = (data) => {
+    const h = head;
+    head = null;
+    return out.write(encodeFrame(data, h));
   };
 
-  const pipeDown = async (socket, allowRetry) => {
+  const writeMux = (sessionId, status, option, data) => {
+    const h = head;
+    head = null;
+    return out.write(encodeGrpcMuxFrame(sessionId, status, option, data, h));
+  };
+
+  const saveReplay = (target, chunk) => {
+    if (!target.replayChunks || target.hasData || target.fallbackUsed || !chunk.byteLength) return -1;
+    if (target.replayBytes + chunk.byteLength > MAX_REPLAY_BYTES) return -1;
+    target.replayBytes += chunk.byteLength;
+    return target.replayChunks.push(chunk.slice()) - 1;
+  };
+
+  const pipeSocket = async (socket, sess, isMuxSession) => {
+    const chunkLimit = isMuxSession ? MUX_CHUNK_SIZE : READ_CHUNK_SIZE;
     let sockReader;
     let byob = false;
     try {
@@ -427,22 +587,30 @@ const tunnel = async (request, writable, earlyData) => {
       sockReader = socket.readable.getReader();
     }
 
-    let head = new Uint8Array([state.header.version, 0]);
     try {
       if (byob) {
-        let readBuf = new ArrayBuffer(READ_CHUNK_SIZE);
+        let readBuf = new ArrayBuffer(chunkLimit);
         for (;;) {
-          const { done, value } = await sockReader.read(new Uint8Array(readBuf, 0, READ_CHUNK_SIZE));
+          const { done, value } = await sockReader.read(new Uint8Array(readBuf, 0, chunkLimit));
           if (done) break;
           if (!value || !value.byteLength) {
-            if (value && value.buffer.byteLength >= READ_CHUNK_SIZE) readBuf = value.buffer;
+            if (value && value.buffer.byteLength >= chunkLimit) readBuf = value.buffer;
             continue;
           }
-          state.hasData = true;
-          state.replayChunks = null;
-          const frame = encodeFrame(value, head);
-          readBuf = value.buffer.byteLength >= READ_CHUNK_SIZE ? value.buffer : new ArrayBuffer(READ_CHUNK_SIZE);
-          head = null;
+          sess.hasData = true;
+          sess.replayChunks = null;
+          const frame = isMuxSession
+            ? (() => {
+                const h = head;
+                head = null;
+                return encodeGrpcMuxFrame(sess.id, 2, 1, value, h);
+              })()
+            : (() => {
+                const h = head;
+                head = null;
+                return encodeFrame(value, h);
+              })();
+          readBuf = value.buffer.byteLength >= chunkLimit ? value.buffer : new ArrayBuffer(chunkLimit);
           await out.write(frame);
         }
       } else {
@@ -450,37 +618,38 @@ const tunnel = async (request, writable, earlyData) => {
           const { done, value } = await sockReader.read();
           if (done) break;
           if (!value || !value.byteLength) continue;
-          state.hasData = true;
-          state.replayChunks = null;
+          sess.hasData = true;
+          sess.replayChunks = null;
           const len = value.byteLength;
-          if (len <= READ_CHUNK_SIZE) {
-            await out.write(encodeFrame(value, head));
-            head = null;
-          } else {
-            for (let off = 0; off < len; off += READ_CHUNK_SIZE) {
-              const end = off + READ_CHUNK_SIZE < len ? off + READ_CHUNK_SIZE : len;
-              await out.write(encodeFrame(value.subarray(off, end), head));
-              head = null;
-            }
+          for (let off = 0; off < len; off += chunkLimit) {
+            const end = off + chunkLimit < len ? off + chunkLimit : len;
+            const slice = off === 0 && end === len ? value : value.subarray(off, end);
+            if (isMuxSession) await writeMux(sess.id, 2, 1, slice);
+            else await writeGrpc(slice);
           }
         }
       }
 
-      if (!state.hasData && allowRetry && TARGET_HOST && !state.fallbackUsed && !state.closed) {
+      if (!sess.hasData && sess.allowRetry && TARGET_HOST && !sess.fallbackUsed && !state.closed && !sess.closed) {
         try {
           sockReader.releaseLock();
         } catch {}
         try {
           socket.close();
         } catch {}
-        await switchToFallback();
+        await sess.switchFallback();
         return;
       }
 
-      if (head) await out.write(encodeFrame(head));
-      await out.close();
+      if (isMuxSession) {
+        muxSessions.delete(sess.id);
+        await writeMux(sess.id, 3, 0, null);
+      } else {
+        if (head) await writeGrpc(EMPTY);
+        await out.close();
+      }
     } catch (err) {
-      if (!state.hasData && allowRetry && TARGET_HOST && !state.fallbackUsed && !state.closed) {
+      if (!sess.hasData && sess.allowRetry && TARGET_HOST && !sess.fallbackUsed && !state.closed && !sess.closed) {
         try {
           sockReader.releaseLock();
         } catch {}
@@ -488,55 +657,323 @@ const tunnel = async (request, writable, earlyData) => {
           socket.close();
         } catch {}
         try {
-          await switchToFallback();
+          await sess.switchFallback();
           return;
         } catch {}
       }
-      try {
-        await out.abort(err);
-      } catch {}
+      if (isMuxSession) {
+        muxSessions.delete(sess.id);
+        writeMux(sess.id, 3, 2, null).catch(() => {});
+      } else {
+        try {
+          await out.abort(err);
+        } catch {}
+      }
     } finally {
       try {
         sockReader.releaseLock();
       } catch {}
-      if (state.socket === socket) {
+      if (sess.socket === socket) {
         try {
           socket.close();
         } catch {}
-        stopReader();
+        if (!isMuxSession) stopReader();
       }
     }
   };
 
-  const switchToFallback = () => {
-    if (state.fallbackPromise) return state.fallbackPromise;
-    state.fallbackUsed = true;
-    state.fallbackPromise = (async () => {
-      if (state.sink) {
+  const makeFallbackSwitcher = (sess, isMuxSession) => () => {
+    if (sess.fallbackPromise) return sess.fallbackPromise;
+    sess.fallbackUsed = true;
+    sess.fallbackPromise = (async () => {
+      if (sess.sink) {
         try {
-          state.sink.releaseLock();
+          sess.sink.releaseLock();
         } catch {}
-        state.sink = null;
+        sess.sink = null;
       }
-      if (state.socket) {
+      if (sess.socket) {
         try {
-          state.socket.close();
+          sess.socket.close();
         } catch {}
       }
-      const sock = await openProxyFallback(state.header.port);
-      state.socket = sock;
-      state.sink = sock.writable.getWriter();
-      state.downlink = pipeDown(sock, false);
-      const chunks = state.replayChunks;
-      state.replayChunks = null;
+      const sock = await openProxyFallback(sess.port);
+      sess.socket = sock;
+      sess.sink = sock.writable.getWriter();
+      sess.allowRetry = false;
+      sess.downlink = pipeSocket(sock, sess, isMuxSession);
+      const chunks = sess.replayChunks;
+      sess.replayChunks = null;
       if (chunks) {
-        state.replayedCount = chunks.length;
+        sess.replayedCount = chunks.length;
         for (let i = 0; i < chunks.length; i++) {
-          await state.sink.write(chunks[i]);
+          await sess.sink.write(chunks[i]);
         }
       }
     })();
-    return state.fallbackPromise;
+    return sess.fallbackPromise;
+  };
+
+  state.switchFallback = makeFallbackSwitcher(state, false);
+
+  const openMuxUdpSession = (id) => {
+    const sess = {
+      id,
+      socket: null,
+      sink: null,
+      downlink: null,
+      closed: false,
+      txMap: new Map(),
+      writeChain: Promise.resolve(),
+      ensureSocket() {
+        if (sess.socket) return;
+        const sock = connect({ hostname: '8.8.4.4', port: 53 });
+        sess.socket = sock;
+        sess.sink = sock.writable.getWriter();
+        sess.downlink = (async () => {
+          const r = sock.readable.getReader();
+          let dbuf = EMPTY;
+          try {
+            for (;;) {
+              const { done, value } = await r.read();
+              if (done) break;
+              if (!value || !value.byteLength) continue;
+              dbuf = dbuf.byteLength ? concat(dbuf, value) : value;
+              let doff = 0;
+              while (dbuf.byteLength - doff >= 2) {
+                const msgLen = (dbuf[doff] << 8) | dbuf[doff + 1];
+                if (dbuf.byteLength - doff < 2 + msgLen) break;
+                const pkt = dbuf.subarray(doff + 2, doff + 2 + msgLen);
+                doff += 2 + msgLen;
+                if (pkt.byteLength >= 2) {
+                  const txId = (pkt[0] << 8) | pkt[1];
+                  const qKey = sess.txMap.get(txId);
+                  if (qKey) {
+                    sess.txMap.delete(txId);
+                    dnsCacheSet(qKey, pkt);
+                  }
+                }
+                await writeMux(id, 2, 1, pkt);
+              }
+              dbuf = doff < dbuf.byteLength ? dbuf.slice(doff) : EMPTY;
+            }
+            muxSessions.delete(id);
+            await writeMux(id, 3, 0, null);
+          } catch {
+            muxSessions.delete(id);
+            writeMux(id, 3, 2, null).catch(() => {});
+          } finally {
+            try {
+              r.releaseLock();
+            } catch {}
+            try {
+              sock.close();
+            } catch {}
+          }
+        })();
+      },
+      sendQuery(pkt) {
+        if (!pkt.byteLength || sess.closed) return;
+        const cached = dnsCacheGet(pkt);
+        if (cached) {
+          sess.writeChain = sess.writeChain.then(() => writeMux(id, 2, 1, cached));
+          return;
+        }
+        sess.writeChain = sess.writeChain.then(async () => {
+          if (sess.closed) return;
+          if (!sess.socket) sess.ensureSocket();
+          if (pkt.byteLength > 12) {
+            const txId = (pkt[0] << 8) | pkt[1];
+            const qKey = dnsQueryKey(pkt);
+            if (qKey) sess.txMap.set(txId, qKey);
+          }
+          const outPkt = new Uint8Array(2 + pkt.byteLength);
+          outPkt[0] = pkt.byteLength >>> 8;
+          outPkt[1] = pkt.byteLength;
+          outPkt.set(pkt, 2);
+          await sess.sink.write(outPkt);
+        }).catch(() => sess.abort());
+      },
+      closeWrite() {
+        sess.writeChain = sess.writeChain.then(async () => {
+          if (sess.sink) {
+            try {
+              await sess.sink.close();
+            } catch {}
+          } else {
+            muxSessions.delete(id);
+            await writeMux(id, 3, 0, null);
+          }
+        }).catch(() => sess.abort());
+      },
+      abort() {
+        if (sess.closed) return;
+        sess.closed = true;
+        muxSessions.delete(id);
+        try {
+          sess.socket?.close();
+        } catch {}
+        writeMux(id, 3, 2, null).catch(() => {});
+      },
+    };
+    muxSessions.set(id, sess);
+    return sess;
+  };
+
+  const openMuxTcpSession = (id, host, port, initialData) => {
+    const sess = {
+      id,
+      port,
+      socket: null,
+      sink: null,
+      downlink: null,
+      hasData: false,
+      allowRetry: !!TARGET_HOST,
+      fallbackUsed: false,
+      fallbackPromise: null,
+      replayChunks: [],
+      replayBytes: 0,
+      replayedCount: 0,
+      closed: false,
+      switchFallback: null,
+      writeChain: null,
+      sendData(chunk) {
+        if (!chunk.byteLength || sess.closed) return;
+        const copy = chunk.slice();
+        sess.writeChain = sess.writeChain.then(async () => {
+          if (sess.closed || state.closed) return;
+          if (sess.fallbackPromise) await sess.fallbackPromise;
+          const canRetry = !sess.fallbackUsed && !!TARGET_HOST;
+          const savedIdx = canRetry ? saveReplay(sess, copy) : -1;
+          try {
+            await sess.sink.write(copy);
+          } catch (err) {
+            if (sess.closed || state.closed || !canRetry) throw err;
+            await sess.switchFallback();
+            if (savedIdx === -1 || savedIdx >= sess.replayedCount) {
+              await sess.sink.write(copy);
+            }
+          }
+        }).catch(() => sess.abort());
+      },
+      closeWrite() {
+        sess.writeChain = sess.writeChain.then(async () => {
+          if (sess.fallbackPromise) await sess.fallbackPromise;
+          if (sess.sink) {
+            try {
+              await sess.sink.close();
+            } catch {}
+          }
+        }).catch(() => sess.abort());
+      },
+      abort() {
+        if (sess.closed) return;
+        sess.closed = true;
+        muxSessions.delete(id);
+        try {
+          sess.socket?.close();
+        } catch {}
+        writeMux(id, 3, 2, null).catch(() => {});
+      },
+    };
+
+    sess.switchFallback = makeFallbackSwitcher(sess, true);
+    muxSessions.set(id, sess);
+
+    const initData = initialData.byteLength ? initialData.slice() : EMPTY;
+    if (initData.byteLength) saveReplay(sess, initData);
+
+    sess.writeChain = (async () => {
+      let sock;
+      try {
+        sock = await open(host, port);
+      } catch (err) {
+        if (!sess.allowRetry) throw err;
+        sess.fallbackUsed = true;
+        sess.allowRetry = false;
+        sock = await openProxyFallback(port);
+      }
+      if (sess.closed || state.closed) {
+        try {
+          sock.close();
+        } catch {}
+        return;
+      }
+      sess.socket = sock;
+      sess.sink = sock.writable.getWriter();
+      sess.downlink = pipeSocket(sock, sess, true);
+      if (initData.byteLength) await sess.sink.write(initData);
+    })().catch(() => sess.abort());
+
+    return sess;
+  };
+
+  const feedMux = (chunk) => {
+    muxBuf = muxBuf.byteLength ? concat(muxBuf, chunk) : chunk;
+    const total = muxBuf.byteLength;
+    let off = 0;
+
+    while (total - off >= 2 && !state.closed) {
+      const metaLen = (muxBuf[off] << 8) | muxBuf[off + 1];
+      if (metaLen < 4) throw new Error('bad mux meta');
+      if (total - off < 2 + metaLen) break;
+
+      const m = off + 2;
+      const metaEnd = m + metaLen;
+      const id = (muxBuf[m] << 8) | muxBuf[m + 1];
+      const status = muxBuf[m + 2];
+      const option = muxBuf[m + 3];
+
+      let payload = EMPTY;
+      if (option & 1) {
+        if (total - metaEnd < 2) break;
+        const dLen = (muxBuf[metaEnd] << 8) | muxBuf[metaEnd + 1];
+        if (total - metaEnd - 2 < dLen) break;
+        payload = muxBuf.subarray(metaEnd + 2, metaEnd + 2 + dLen);
+        off = metaEnd + 2 + dLen;
+      } else {
+        off = metaEnd;
+      }
+
+      if (status === 4) continue;
+
+      if (status === 1) {
+        const target = parseMuxTarget(muxBuf, m + 4, metaEnd);
+        if (!target || (target.net === 2 && target.port !== 53)) {
+          writeMux(id, 3, 2, null).catch(() => {});
+          continue;
+        }
+        const existing = muxSessions.get(id);
+        if (existing) existing.abort();
+        if (target.net === 2) {
+          const s = openMuxUdpSession(id);
+          if (payload.byteLength) s.sendQuery(payload);
+        } else {
+          openMuxTcpSession(id, target.host, target.port, payload);
+        }
+      } else if (status === 2) {
+        const s = muxSessions.get(id);
+        if (s && payload.byteLength) {
+          if (s.sendQuery) s.sendQuery(payload);
+          else s.sendData(payload);
+        }
+      } else if (status === 3) {
+        const s = muxSessions.get(id);
+        if (s) {
+          if (option & 2) {
+            s.abort();
+          } else {
+            if (payload.byteLength) {
+              if (s.sendQuery) s.sendQuery(payload);
+              else s.sendData(payload);
+            }
+            s.closeWrite();
+          }
+        }
+      }
+    }
+
+    muxBuf = off < total ? muxBuf.slice(off) : EMPTY;
   };
 
   const initConnection = async (rawBytes) => {
@@ -545,29 +982,38 @@ const tunnel = async (request, writable, earlyData) => {
     if (!header) throw new Error('bad request');
     if (header.needMore) return;
 
+    state.header = header;
+    head = new Uint8Array([header.version, 0]);
+    const initialData = headerBuf.subarray(header.offset);
+    headerBuf = EMPTY;
+
+    if (header.cmd === 3) {
+      state.isMux = true;
+      if (initialData.byteLength) feedMux(initialData);
+      return;
+    }
+
     const isUDP = header.cmd === 2;
     const destHost = isUDP ? '8.8.4.4' : header.host;
     const destPort = isUDP ? 53 : header.port;
-    state.header = { version: header.version, host: destHost, port: destPort, isUDP };
+    state.port = destPort;
+    state.allowRetry = !isUDP && !!TARGET_HOST;
 
-    const initialData = headerBuf.subarray(header.offset);
-    headerBuf = EMPTY;
-    if (initialData.byteLength) saveReplay(initialData);
+    if (initialData.byteLength) saveReplay(state, initialData);
 
     let sock;
-    let allowRetry = !isUDP && !!TARGET_HOST;
     try {
       sock = await open(destHost, destPort);
     } catch (err) {
-      if (!allowRetry) throw err;
+      if (!state.allowRetry) throw err;
       state.fallbackUsed = true;
-      allowRetry = false;
+      state.allowRetry = false;
       sock = await openProxyFallback(destPort);
     }
 
     state.socket = sock;
     state.sink = sock.writable.getWriter();
-    state.downlink = pipeDown(sock, allowRetry);
+    state.downlink = pipeSocket(sock, state, false);
     if (initialData.byteLength) {
       await state.sink.write(initialData);
     }
@@ -577,12 +1023,12 @@ const tunnel = async (request, writable, earlyData) => {
     if (!chunk.byteLength) return;
     if (state.fallbackPromise) await state.fallbackPromise;
     const canRetry = !state.fallbackUsed && !!TARGET_HOST;
-    const savedIdx = canRetry ? saveReplay(chunk) : -1;
+    const savedIdx = canRetry ? saveReplay(state, chunk) : -1;
     try {
       await state.sink.write(chunk);
     } catch (err) {
       if (state.closed || !canRetry) throw err;
-      await switchToFallback();
+      await state.switchFallback();
       if (savedIdx === -1 || savedIdx >= state.replayedCount) {
         await state.sink.write(chunk);
       }
@@ -626,6 +1072,8 @@ const tunnel = async (request, writable, earlyData) => {
             const data = buf.subarray(i, i + n);
             if (!state.header) {
               await initConnection(data);
+            } else if (state.isMux) {
+              if (n) feedMux(data);
             } else if (n) {
               await writeUpstream(data);
             }
@@ -637,19 +1085,40 @@ const tunnel = async (request, writable, earlyData) => {
     }
 
     state.closed = true;
-    if (state.fallbackPromise) await state.fallbackPromise;
-    if (state.sink) {
-      await state.sink.close();
-      while (state.downlink) {
-        const p = state.downlink;
-        await p;
-        if (state.downlink === p) break;
+    if (state.isMux) {
+      const active = [...muxSessions.values()];
+      for (let i = 0; i < active.length; i++) active[i].closeWrite();
+      for (let i = 0; i < active.length; i++) {
+        await active[i].writeChain;
+        while (active[i].downlink) {
+          const p = active[i].downlink;
+          await p;
+          if (active[i].downlink === p) break;
+        }
       }
-    } else {
+      if (head) await writeGrpc(EMPTY);
       await out.close();
+    } else {
+      if (state.fallbackPromise) await state.fallbackPromise;
+      if (state.sink) {
+        await state.sink.close();
+        while (state.downlink) {
+          const p = state.downlink;
+          await p;
+          if (state.downlink === p) break;
+        }
+      } else {
+        await out.close();
+      }
     }
   } catch {
     state.closed = true;
+    for (const sess of muxSessions.values()) {
+      try {
+        sess.socket?.close();
+      } catch {}
+    }
+    muxSessions.clear();
     try {
       state.socket?.close();
     } catch {}
@@ -679,13 +1148,13 @@ export default {
     if ((request.method === 'GET' || request.method === 'HEAD') && (pathname === '/' || pathname === '/index.html')) {
       return new Response(request.method === 'HEAD' ? null : NGINX_BODY, {
         status: 200,
-        headers: HTML_HEADERS,
+        headers: HTML_CACHE_HEADERS,
       });
     }
 
     return new Response(request.method === 'HEAD' ? null : NOT_FOUND_BODY, {
       status: 404,
-      headers: HTML_HEADERS,
+      headers: HTML_CACHE_HEADERS,
     });
   },
 };
