@@ -9,6 +9,7 @@ const CONNECT_TIMEOUT_MS = 1500;
 const FALLBACK_TIMEOUT_MS = 1200;
 const DOH_TIMEOUT_MS = 1500;
 const PARALLEL_DIALS = 2;
+const READ_CHUNK_SIZE = 65536;
 const MUX_CHUNK_SIZE = 65500;
 const MAX_FRAME = 1 << 20;
 const MAX_REPLAY_BYTES = 65536;
@@ -17,6 +18,7 @@ const EARLY_DATA_MAX_BYTES = 8192;
 const EARLY_DATA_MAX_B64 = Math.ceil((EARLY_DATA_MAX_BYTES * 4) / 3) + 4;
 const PROXY_CACHE_TTL_MS = 1800000;
 const PROXY_NEGATIVE_CACHE_TTL_MS = 15000;
+const PROXY_FAIL_RETRY_MS = 30000;
 const BAD_TARGET_TTL_MS = 60000;
 const DNS_CACHE_TTL_MS = 60000;
 const DNS_CACHE_MAX = 256;
@@ -558,7 +560,8 @@ const openProxyFallback = async (fallbackPort) => {
     } catch {}
   }
 
-  proxyCacheAt = 0;
+  proxyCacheAt = Date.now();
+  proxyCacheTtl = PROXY_FAIL_RETRY_MS;
   throw new Error('Proxy failed');
 };
 
@@ -682,30 +685,65 @@ const tunnel = async (request, streamOut, earlyData, state) => {
   };
 
   const pipeSocket = async (socket, sess, isMuxSession) => {
-    const sockReader = socket.readable.getReader();
+    const chunkLimit = isMuxSession ? MUX_CHUNK_SIZE : READ_CHUNK_SIZE;
+    let sockReader;
+    let byob = false;
     try {
-      for (;;) {
-        const w = streamOut.waitReady();
-        if (w) await w;
-        if (streamOut.isClosed() || state.closed || sess.closed) break;
+      sockReader = socket.readable.getReader({ mode: 'byob' });
+      byob = true;
+    } catch {
+      sockReader = socket.readable.getReader();
+    }
 
-        const { done, value } = await sockReader.read();
-        if (done) break;
-        if (!value || !value.byteLength) continue;
+    try {
+      if (byob) {
+        let readBuf = new ArrayBuffer(chunkLimit);
+        for (;;) {
+          const w = streamOut.waitReady();
+          if (w) await w;
+          if (streamOut.isClosed() || state.closed || sess.closed) break;
 
-        sess.hasData = true;
-        sess.replayChunks = null;
+          const { done, value } = await sockReader.read(new Uint8Array(readBuf, 0, chunkLimit));
+          if (done) break;
+          if (!value || !value.byteLength) {
+            if (value && value.buffer.byteLength >= chunkLimit) readBuf = value.buffer;
+            continue;
+          }
+          sess.hasData = true;
+          sess.replayChunks = null;
+          let h = null;
+          if (head) {
+            h = head;
+            head = null;
+          }
+          const frame = isMuxSession
+            ? encodeGrpcMuxFrame(sess.id, 2, 1, value, h)
+            : encodeFrame(value, h);
+          readBuf = value.buffer.byteLength >= chunkLimit ? value.buffer : new ArrayBuffer(chunkLimit);
+          streamOut.enqueue(frame);
+        }
+      } else {
+        for (;;) {
+          const w = streamOut.waitReady();
+          if (w) await w;
+          if (streamOut.isClosed() || state.closed || sess.closed) break;
 
-        if (!isMuxSession) {
-          emitGrpc(value);
-        } else {
-          const len = value.byteLength;
-          if (len <= MUX_CHUNK_SIZE) {
-            emitMux(sess.id, 2, 1, value);
+          const { done, value } = await sockReader.read();
+          if (done) break;
+          if (!value || !value.byteLength) continue;
+          sess.hasData = true;
+          sess.replayChunks = null;
+          if (!isMuxSession) {
+            emitGrpc(value);
           } else {
-            for (let off = 0; off < len; off += MUX_CHUNK_SIZE) {
-              const end = off + MUX_CHUNK_SIZE < len ? off + MUX_CHUNK_SIZE : len;
-              emitMux(sess.id, 2, 1, value.subarray(off, end));
+            const len = value.byteLength;
+            if (len <= chunkLimit) {
+              emitMux(sess.id, 2, 1, value);
+            } else {
+              for (let off = 0; off < len; off += chunkLimit) {
+                const end = off + chunkLimit < len ? off + chunkLimit : len;
+                emitMux(sess.id, 2, 1, value.subarray(off, end));
+              }
             }
           }
         }
@@ -975,7 +1013,7 @@ const tunnel = async (request, streamOut, earlyData, state) => {
             notifyMuxDrain();
 
             if (sess.fallbackPromise) await sess.fallbackPromise;
-            const canRetry = !sess.fallbackUsed && !!TARGET_HOST;
+            const canRetry = !sess.hasData && !sess.fallbackUsed && !!TARGET_HOST;
             const savedIdx = canRetry ? saveReplay(sess, copy) : -1;
             try {
               await sess.sink.write(copy);
@@ -1220,12 +1258,15 @@ const tunnel = async (request, streamOut, earlyData, state) => {
   const writeUpstream = async (chunk) => {
     if (!chunk.byteLength) return;
     if (state.fallbackPromise) await state.fallbackPromise;
-    const canRetry = !state.fallbackUsed && !!TARGET_HOST;
-    const savedIdx = canRetry ? saveReplay(state, chunk) : -1;
+    if (state.hasData || state.fallbackUsed || !TARGET_HOST) {
+      await state.sink.write(chunk);
+      return;
+    }
+    const savedIdx = saveReplay(state, chunk);
     try {
       await state.sink.write(chunk);
     } catch (err) {
-      if (state.closed || !canRetry) throw err;
+      if (state.closed) throw err;
       await state.switchFallback();
       if (savedIdx === -1 || savedIdx >= state.replayedCount) {
         await state.sink.write(chunk);
