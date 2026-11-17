@@ -9,6 +9,42 @@ const FALLBACK_TIMEOUT_MS = 1500;
 const PARALLEL_DIALS = 3;
 const MAX_FRAME = 1 << 20;
 const MAX_REPLAY_BYTES = 65536;
+const EARLY_DATA_MAX_BYTES = 8192;
+const EARLY_DATA_MAX_B64 = Math.ceil((EARLY_DATA_MAX_BYTES * 4) / 3) + 4;
+
+const NGINX_BODY = new TextEncoder().encode(`<!DOCTYPE html>
+<html>
+<head>
+<title>Welcome to nginx!</title>
+<style>
+html { color-scheme: light dark; }
+body { width: 35em; margin: 0 auto;
+font-family: Tahoma, Verdana, Arial, sans-serif; }
+</style>
+</head>
+<body>
+<h1>Welcome to nginx!</h1>
+<p>If you see this page, the nginx web server is successfully installed and
+working. Further configuration is required.</p>
+
+<p>For online documentation and support please refer to
+<a href="http://nginx.org/">nginx.org</a>.<br/>
+Commercial support is available at
+<a href="http://nginx.com/">nginx.com</a>.</p>
+
+<p><em>Thank you for using nginx.</em></p>
+</body>
+</html>
+`);
+
+const NOT_FOUND_BODY = new TextEncoder().encode(`<html>
+<head><title>404 Not Found</title></head>
+<body>
+<center><h1>404 Not Found</h1></center>
+<hr><center>nginx</center>
+</body>
+</html>
+`);
 
 const USER_ID = Uint8Array.from(UUID.replace(/-/g, '').match(/../g), (h) => parseInt(h, 16));
 const PATHS = new Set([`/${SERVICE_NAME}/Tun`, `/${SERVICE_NAME}/TunMulti`]);
@@ -87,6 +123,39 @@ const parseHeader = (d) => {
     return null;
   }
   return { version: d[0], cmd, port, host, offset: p };
+};
+
+const decodeEarlyData = (request) => {
+  const raw =
+    request.headers.get('sec-websocket-protocol') ||
+    request.headers.get('x-early-data') ||
+    request.headers.get('early-data') ||
+    '';
+  if (!raw || raw.length > EARLY_DATA_MAX_B64) return null;
+  let bytes;
+  if (typeof Uint8Array.fromBase64 === 'function') {
+    try {
+      bytes = Uint8Array.fromBase64(raw, { alphabet: 'base64url' });
+    } catch {
+      return null;
+    }
+  } else {
+    let b64 = raw.replace(/-/g, '+').replace(/_/g, '/');
+    const pad = b64.length % 4;
+    if (pad) b64 += '='.repeat(4 - pad);
+    let bin;
+    try {
+      bin = atob(b64);
+    } catch {
+      return null;
+    }
+    bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  }
+  if (!bytes.byteLength || bytes.byteLength > EARLY_DATA_MAX_BYTES) return null;
+  const h = parseHeader(bytes);
+  if (!h || h.needMore) return null;
+  return bytes;
 };
 
 const dohQuery = async (name, type) => {
@@ -226,7 +295,7 @@ const openProxyFallback = async (destHost, fallbackPort) => {
   throw new Error('All proxy targets failed');
 };
 
-const tunnel = async (request, writable) => {
+const tunnel = async (request, writable, earlyData) => {
   const out = writable.getWriter();
   const reader = request.body.getReader();
   const stopReader = () => reader.cancel().catch(() => {});
@@ -330,6 +399,38 @@ const tunnel = async (request, writable) => {
     return state.fallbackPromise;
   };
 
+  const initConnection = async (rawBytes) => {
+    headerBuf = headerBuf.length ? concat(headerBuf, rawBytes) : rawBytes;
+    const header = parseHeader(headerBuf);
+    if (!header) throw new Error('bad request');
+    if (header.needMore) return;
+    if (header.cmd !== 1 && !(header.cmd === 2 && header.port === 53)) {
+      throw new Error('bad command');
+    }
+    const destHost = header.cmd === 2 ? '8.8.4.4' : header.host;
+    const destPort = header.cmd === 2 ? 53 : header.port;
+    state.header = { version: header.version, host: destHost, port: destPort, isUDP: header.cmd === 2 };
+    const initialData = headerBuf.subarray(header.offset);
+    headerBuf = new Uint8Array(0);
+
+    if (initialData.length) saveReplay(initialData);
+
+    let sock;
+    let allowRetry = !state.header.isUDP && !!TARGET_HOST;
+    try {
+      sock = await open(destHost, destPort);
+    } catch (err) {
+      if (!allowRetry) throw err;
+      state.fallbackUsed = true;
+      allowRetry = false;
+      sock = await openProxyFallback(destHost, destPort);
+    }
+    state.socket = sock;
+    state.sink = sock.writable.getWriter();
+    state.downlink = pipeDown(sock, allowRetry);
+    if (initialData.length) await state.sink.write(initialData);
+  };
+
   const writeUpstream = async (chunk) => {
     if (!chunk.length) return;
     if (state.fallbackPromise) await state.fallbackPromise;
@@ -347,6 +448,9 @@ const tunnel = async (request, writable) => {
   };
 
   try {
+    if (earlyData) {
+      await initConnection(earlyData);
+    }
     for (;;) {
       const { done, value } = await reader.read();
       if (done) break;
@@ -373,35 +477,7 @@ const tunnel = async (request, writable) => {
           const data = message.subarray(i, i + n);
           i += n;
           if (!state.header) {
-            headerBuf = headerBuf.length ? concat(headerBuf, data) : data;
-            const header = parseHeader(headerBuf);
-            if (!header) throw new Error('bad request');
-            if (header.needMore) continue;
-            if (header.cmd !== 1 && !(header.cmd === 2 && header.port === 53)) {
-              throw new Error('bad command');
-            }
-            const destHost = header.cmd === 2 ? '8.8.4.4' : header.host;
-            const destPort = header.cmd === 2 ? 53 : header.port;
-            state.header = { version: header.version, host: destHost, port: destPort, isUDP: header.cmd === 2 };
-            const initialData = headerBuf.subarray(header.offset);
-            headerBuf = new Uint8Array(0);
-
-            if (initialData.length) saveReplay(initialData);
-
-            let sock;
-            let allowRetry = !state.header.isUDP && !!TARGET_HOST;
-            try {
-              sock = await open(destHost, destPort);
-            } catch (err) {
-              if (!allowRetry) throw err;
-              state.fallbackUsed = true;
-              allowRetry = false;
-              sock = await openProxyFallback(destHost, destPort);
-            }
-            state.socket = sock;
-            state.sink = sock.writable.getWriter();
-            state.downlink = pipeDown(sock, allowRetry);
-            if (initialData.length) await state.sink.write(initialData);
+            await initConnection(data);
           } else if (n) {
             await writeUpstream(data);
           }
@@ -434,19 +510,30 @@ const tunnel = async (request, writable) => {
 
 export default {
   fetch(request, env, ctx) {
+    const url = new URL(request.url);
     const contentType = request.headers.get('content-type') || '';
     if (
-      request.method !== 'POST' ||
-      !request.body ||
-      !contentType.startsWith('application/grpc') ||
-      !PATHS.has(new URL(request.url).pathname)
+      request.method === 'POST' &&
+      request.body &&
+      contentType.startsWith('application/grpc') &&
+      PATHS.has(url.pathname)
     ) {
-      return new Response(null, { status: 404 });
+      const earlyData = decodeEarlyData(request);
+      const { readable, writable } = new TransformStream();
+      ctx.waitUntil(tunnel(request, writable, earlyData));
+      return new Response(readable, {
+        headers: { 'content-type': 'application/grpc', 'cache-control': 'no-store' },
+      });
     }
-    const { readable, writable } = new TransformStream();
-    ctx.waitUntil(tunnel(request, writable));
-    return new Response(readable, {
-      headers: { 'content-type': 'application/grpc', 'cache-control': 'no-store' },
+    if ((request.method === 'GET' || request.method === 'HEAD') && (url.pathname === '/' || url.pathname === '/index.html')) {
+      return new Response(request.method === 'HEAD' ? null : NGINX_BODY, {
+        status: 200,
+        headers: { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' },
+      });
+    }
+    return new Response(request.method === 'HEAD' ? null : NOT_FOUND_BODY, {
+      status: 404,
+      headers: { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' },
     });
   },
 };
