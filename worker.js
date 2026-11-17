@@ -1,367 +1,264 @@
-import { connect } from "cloudflare:sockets";
+import { connect } from 'cloudflare:sockets';
 
-const UUID = "00000000-0000-4000-8000-000000000000";
-const GRPC_SERVICE_NAME = "GunService";
-const TARGET_HOST = "proxyip.fxxk.dedyn.io";
-const TARGET_PORT = 443;
-
-const MAX_CHUNK = 65536;
-const MAX_GRPC_FRAME = 16777216;
+const UUID = '00000000-0000-4000-8000-000000000000';
+const TARGET_HOST = '';
+const TARGET_PORT = 0;
+const NAT64_PREFIX = '2001:67c:2960:6464::';
 const CONNECT_TIMEOUT_MS = 5000;
-const EMPTY = new Uint8Array(0);
+const MAX_FRAME = 1 << 20;
+
+const USER_ID = Uint8Array.from(UUID.replace(/-/g, '').match(/../g), (h) => parseInt(h, 16));
 const decoder = new TextDecoder();
+const IPV4 = /^(\d{1,3}\.){3}\d{1,3}$/;
 
-function toUint8(data) {
-  if (data instanceof Uint8Array) return data;
-  if (data instanceof ArrayBuffer) return new Uint8Array(data);
-  if (ArrayBuffer.isView(data)) return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
-  return new Uint8Array(data || 0);
-}
-
-function concatBytes(a, b) {
-  if (!a.byteLength) return b;
-  if (!b.byteLength) return a;
-  const out = new Uint8Array(a.byteLength + b.byteLength);
-  out.set(a, 0);
-  out.set(b, a.byteLength);
+const concat = (a, b) => {
+  const out = new Uint8Array(a.length + b.length);
+  out.set(a);
+  out.set(b, a.length);
   return out;
-}
+};
 
-function parseUuid(uuid) {
-  const hex = String(uuid || "").replace(/-/g, "");
-  if (hex.length !== 32 || !/^[0-9a-fA-F]{32}$/.test(hex)) return null;
-  const bytes = new Uint8Array(16);
-  for (let i = 0; i < 16; i++) {
-    bytes[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+const encodeFrame = (data) => {
+  const n = data.length;
+  let v = n;
+  let varintLength = 1;
+  while (v >= 128) {
+    v >>>= 7;
+    varintLength++;
   }
-  return bytes;
-}
-
-function matchUuid(buf, offset, expected) {
-  if (buf.byteLength < offset + 16) return false;
-  let diff = 0;
-  for (let i = 0; i < 16; i++) {
-    diff |= buf[offset + i] ^ expected[i];
+  const messageLength = 1 + varintLength + n;
+  const out = new Uint8Array(5 + messageLength);
+  new DataView(out.buffer).setUint32(1, messageLength);
+  out[5] = 10;
+  let o = 6;
+  v = n;
+  while (v >= 128) {
+    out[o++] = (v & 127) | 128;
+    v >>>= 7;
   }
-  return diff === 0;
-}
+  out[o++] = v;
+  out.set(data, o);
+  return out;
+};
 
-function parseVlessHeader(buf, expectedUuid) {
-  const len = buf.byteLength;
-  if (len < 18) return null;
-  const version = buf[0];
-  if (!matchUuid(buf, 1, expectedUuid)) throw new Error("Invalid UUID");
-  const addonsLen = buf[17];
-  const cmdOffset = 18 + addonsLen;
-  if (len < cmdOffset + 4) return null;
-  const cmd = buf[cmdOffset];
-  if (cmd !== 1 && cmd !== 2) throw new Error("Unsupported command");
-  const port = (buf[cmdOffset + 1] << 8) | buf[cmdOffset + 2];
-  const addrType = buf[cmdOffset + 3];
-  const addrOffset = cmdOffset + 4;
-  let hostname = "";
-  let dataOffset = 0;
-
-  if (addrType === 1) {
-    if (len < addrOffset + 4) return null;
-    hostname = `${buf[addrOffset]}.${buf[addrOffset + 1]}.${buf[addrOffset + 2]}.${buf[addrOffset + 3]}`;
-    dataOffset = addrOffset + 4;
-  } else if (addrType === 2) {
-    if (len < addrOffset + 1) return null;
-    const domLen = buf[addrOffset];
-    if (domLen === 0) throw new Error("Empty domain");
-    if (len < addrOffset + 1 + domLen) return null;
-    hostname = decoder.decode(buf.subarray(addrOffset + 1, addrOffset + 1 + domLen));
-    dataOffset = addrOffset + 1 + domLen;
-  } else if (addrType === 3) {
-    if (len < addrOffset + 16) return null;
-    const parts = [];
-    for (let i = 0; i < 16; i += 2) {
-      parts.push(((buf[addrOffset + i] << 8) | buf[addrOffset + i + 1]).toString(16));
-    }
-    hostname = parts.join(":");
-    dataOffset = addrOffset + 16;
+const parseHeader = (d) => {
+  if (d.length < 22 || d[0] !== 0) return null;
+  for (let i = 0; i < 16; i++) if (d[1 + i] !== USER_ID[i]) return null;
+  let p = 18 + d[17];
+  if (p + 4 > d.length) return null;
+  const cmd = d[p];
+  const port = (d[p + 1] << 8) | d[p + 2];
+  const type = d[p + 3];
+  p += 4;
+  let host;
+  if (type === 1) {
+    if (p + 4 > d.length) return null;
+    host = d.subarray(p, p + 4).join('.');
+    p += 4;
+  } else if (type === 2) {
+    const length = d[p++];
+    if (!length || p + length > d.length) return null;
+    host = decoder.decode(d.subarray(p, p + length));
+    p += length;
+  } else if (type === 3) {
+    if (p + 16 > d.length) return null;
+    const groups = [];
+    for (let i = 0; i < 16; i += 2) groups.push(((d[p + i] << 8) | d[p + i + 1]).toString(16));
+    host = groups.join(':');
+    p += 16;
   } else {
-    throw new Error("Invalid address type");
+    return null;
   }
+  return { version: d[0], cmd, port, host, payload: d.subarray(p) };
+};
 
-  return {
-    version,
-    cmd,
-    port,
-    hostname,
-    payload: buf.subarray(dataOffset)
-  };
-}
-
-function encodeGrpcHunk(data) {
-  const len = data.byteLength;
-  const varint = [];
-  let n = len >>> 0;
-  while (n > 0x7f) {
-    varint.push((n & 0x7f) | 0x80);
-    n >>>= 7;
-  }
-  varint.push(n);
-  const protoLen = 1 + varint.length + len;
-  const frame = new Uint8Array(5 + protoLen);
-  frame[0] = 0;
-  frame[1] = (protoLen >>> 24) & 0xff;
-  frame[2] = (protoLen >>> 16) & 0xff;
-  frame[3] = (protoLen >>> 8) & 0xff;
-  frame[4] = protoLen & 0xff;
-  frame[5] = 0x0a;
-  frame.set(varint, 6);
-  frame.set(data, 6 + varint.length);
-  return frame;
-}
-
-function formatHost(hostname) {
-  const h = String(hostname || "").trim();
-  if (h.startsWith("[") && h.endsWith("]")) return h;
-  return h.includes(":") ? `[${h}]` : h;
-}
-
-async function openSocketWithTimeout(hostname, port) {
-  const socket = connect({ hostname: formatHost(hostname), port });
+const open = async (hostname, port) => {
+  const socket = connect({ hostname, port });
   let timer;
   try {
     await Promise.race([
       socket.opened,
       new Promise((_, reject) => {
-        timer = setTimeout(() => reject(new Error("Connection timeout")), CONNECT_TIMEOUT_MS);
-      })
+        timer = setTimeout(reject, CONNECT_TIMEOUT_MS, new Error('timeout'));
+      }),
     ]);
     return socket;
-  } catch (err) {
+  } catch (error) {
     try {
       socket.close();
     } catch {}
-    throw err;
+    throw error;
   } finally {
     clearTimeout(timer);
   }
-}
+};
 
-async function openTarget(hostname, port) {
+const resolveV4 = async (host) => {
+  if (IPV4.test(host)) return host;
+  if (host.includes(':')) return null;
   try {
-    return await openSocketWithTimeout(hostname, port);
-  } catch (err) {
-    if (!TARGET_HOST) throw err;
-    return await openSocketWithTimeout(TARGET_HOST, TARGET_PORT);
+    const response = await fetch(
+      `https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(host)}&type=A`,
+      { headers: { accept: 'application/dns-json' } }
+    );
+    const answer = ((await response.json()).Answer || []).find((a) => a.type === 1);
+    return answer ? answer.data : null;
+  } catch {
+    return null;
   }
-}
+};
 
-function handleGrpc(request, expectedUuid) {
-  const reqReader = request.body.getReader();
-  let closed = false;
-  let socket = null;
-  let writer = null;
-  let sockReader = null;
-  let streamController = null;
+const toNat64 = async (host) => {
+  const v4 = await resolveV4(host);
+  if (!v4) return null;
+  const [a, b, c, d] = v4.split('.').map((n) => Number(n).toString(16).padStart(2, '0'));
+  return `${NAT64_PREFIX.replace(/:+$/, '')}::${a}${b}:${c}${d}`;
+};
 
-  const cleanup = () => {
-    if (closed) return;
-    closed = true;
-    if (writer) {
-      try {
-        writer.releaseLock();
-      } catch {}
-      writer = null;
-    }
-    if (sockReader) {
-      try {
-        sockReader.cancel().catch(() => {});
-      } catch {}
-      try {
-        sockReader.releaseLock();
-      } catch {}
-      sockReader = null;
-    }
-    if (socket) {
-      try {
-        socket.close();
-      } catch {}
-      socket = null;
-    }
+const tunnel = async (request, writable) => {
+  const out = writable.getWriter();
+  const reader = request.body.getReader();
+  let header;
+  let socket;
+  let sink;
+  let downlink;
+  let routes;
+  let route = 0;
+  let sent = false;
+  let buf = new Uint8Array(0);
+
+  const pump = async (current) => {
+    const source = current.readable.getReader();
+    let received = false;
     try {
-      reqReader.cancel().catch(() => {});
-    } catch {}
-    try {
-      reqReader.releaseLock();
-    } catch {}
-    if (streamController) {
-      try {
-        streamController.close();
-      } catch {}
-    }
-  };
-
-  const sendChunk = (data) => {
-    if (closed || !streamController) return;
-    const bytes = toUint8(data);
-    for (let off = 0; off < bytes.byteLength; off += MAX_CHUNK) {
-      if (closed) return;
-      const slice = bytes.subarray(off, Math.min(off + MAX_CHUNK, bytes.byteLength));
-      streamController.enqueue(encodeGrpcHunk(slice));
-    }
-  };
-
-  const pumpDownlink = async () => {
-    try {
-      sockReader = socket.readable.getReader();
-      while (!closed) {
-        const { done, value } = await sockReader.read();
+      for (;;) {
+        const { done, value } = await source.read();
         if (done) break;
-        if (value && value.byteLength > 0) sendChunk(value);
+        received = true;
+        await out.write(encodeFrame(value));
       }
-    } catch {
+      if (!received && current === socket && route + 1 < routes.length) {
+        await connectFrom(route + 1);
+        return await downlink;
+      }
+      await out.close();
+    } catch (error) {
+      try {
+        await out.abort(error);
+      } catch {}
     } finally {
-      cleanup();
+      try {
+        current.close();
+      } catch {}
+      reader.cancel().catch(() => {});
     }
   };
 
-  const body = new ReadableStream({
-    start(controller) {
-      streamController = controller;
-      let grpcBuf = EMPTY;
-      let vlessParsed = false;
-      let vlessBuf = EMPTY;
-
-      const onGrpcData = async (chunk) => {
-        if (closed) return;
-        if (!vlessParsed) {
-          vlessBuf = concatBytes(vlessBuf, chunk);
-          const parsed = parseVlessHeader(vlessBuf, expectedUuid);
-          if (!parsed) return;
-          vlessParsed = true;
-          vlessBuf = EMPTY;
-          if (parsed.cmd === 2 && parsed.port !== 53) {
-            throw new Error("UDP is only supported on port 53");
-          }
-          const destHost = parsed.cmd === 2 ? "8.8.4.4" : parsed.hostname;
-          const destPort = parsed.cmd === 2 ? 53 : parsed.port;
-          socket = await openTarget(destHost, destPort);
-          if (closed) {
-            try {
-              socket.close();
-            } catch {}
-            return;
-          }
-          writer = socket.writable.getWriter();
-          sendChunk(new Uint8Array([parsed.version, 0]));
-          pumpDownlink();
-          if (parsed.payload.byteLength > 0) {
-            await writer.write(parsed.payload);
-          }
-        } else if (chunk.byteLength > 0 && writer) {
-          await writer.write(chunk);
-        }
-      };
-
-      const decodeAndForward = async () => {
-        while (grpcBuf.byteLength >= 5 && !closed) {
-          if (grpcBuf[0] !== 0) throw new Error("Compressed gRPC is not supported");
-          const frameLen =
-            ((grpcBuf[1] << 24) >>> 0) |
-            (grpcBuf[2] << 16) |
-            (grpcBuf[3] << 8) |
-            grpcBuf[4];
-          if (frameLen > MAX_GRPC_FRAME) throw new Error("gRPC frame too large");
-          if (grpcBuf.byteLength < 5 + frameLen) break;
-          const payload = grpcBuf.subarray(5, 5 + frameLen);
-          grpcBuf = grpcBuf.byteLength === 5 + frameLen ? EMPTY : grpcBuf.subarray(5 + frameLen);
-
-          let off = 0;
-          while (off < payload.byteLength && !closed) {
-            const tag = payload[off++];
-            let fieldLen = 0;
-            let shift = 0;
-            let valid = false;
-            while (off < payload.byteLength) {
-              const b = payload[off++];
-              fieldLen += (b & 0x7f) * (1 << shift);
-              if ((b & 0x80) === 0) {
-                valid = true;
-                break;
-              }
-              shift += 7;
-              if (shift > 28) throw new Error("Varint overflow");
-            }
-            if (!valid || off + fieldLen > payload.byteLength) {
-              throw new Error("Malformed protobuf payload");
-            }
-            if (tag === 0x0a && fieldLen > 0) {
-              await onGrpcData(payload.subarray(off, off + fieldLen));
-            }
-            off += fieldLen;
-          }
-        }
-      };
-
-      (async () => {
-        try {
-          while (!closed) {
-            const { done, value } = await reqReader.read();
-            if (done) break;
-            if (!value || value.byteLength === 0) continue;
-            grpcBuf = concatBytes(grpcBuf, toUint8(value));
-            await decodeAndForward();
-          }
-          if (!closed) {
-            if (!vlessParsed) {
-              cleanup();
-            } else if (writer) {
-              const w = writer;
-              writer = null;
-              try {
-                await w.close();
-              } catch {}
-              try {
-                w.releaseLock();
-              } catch {}
-            }
-          }
-        } catch {
-          cleanup();
-        }
-      })();
-    },
-    cancel() {
-      cleanup();
+  const attach = async (next, index) => {
+    try {
+      socket?.close();
+    } catch {}
+    socket = next;
+    route = index;
+    sink = next.writable.getWriter();
+    if (!sent) {
+      sent = true;
+      await out.write(encodeFrame(new Uint8Array([header.version, 0])));
     }
-  });
+    if (header.payload.length) await sink.write(header.payload);
+    downlink = pump(next);
+  };
 
-  return new Response(body, {
-    status: 200,
-    headers: {
-      "Content-Type": "application/grpc",
-      "grpc-status": "0",
-      "X-Accel-Buffering": "no",
-      "Cache-Control": "no-store"
+  const connectFrom = async (from) => {
+    let last = new Error('no route');
+    for (let i = from; i < routes.length; i++) {
+      try {
+        return await attach(await routes[i](), i);
+      } catch (error) {
+        last = error;
+      }
     }
-  });
-}
+    throw last;
+  };
+
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf = buf.length ? concat(buf, value) : value;
+      let off = 0;
+      while (buf.length - off >= 5) {
+        if (buf[off] !== 0) throw new Error('compressed');
+        const length = new DataView(buf.buffer, buf.byteOffset + off + 1, 4).getUint32(0);
+        if (length > MAX_FRAME) throw new Error('frame too large');
+        if (buf.length - off < 5 + length) break;
+        const message = buf.subarray(off + 5, off + 5 + length);
+        off += 5 + length;
+        for (let i = 0; i < message.length; ) {
+          if (message[i++] !== 10) throw new Error('bad message');
+          let n = 0;
+          let shift = 0;
+          let byte;
+          do {
+            byte = message[i++];
+            n |= (byte & 127) << shift;
+            shift += 7;
+          } while (byte & 128 && shift < 28);
+          if (byte & 128 || i + n > message.length) throw new Error('bad message');
+          const data = message.subarray(i, i + n);
+          i += n;
+          if (!header) {
+            header = parseHeader(data);
+            if (!header || header.cmd !== 1) throw new Error('bad request');
+            routes = [
+              () => open(header.host, header.port),
+              TARGET_HOST && (() => open(TARGET_HOST, TARGET_PORT || header.port)),
+              NAT64_PREFIX &&
+                (async () => {
+                  const host = await toNat64(header.host);
+                  if (!host) throw new Error('nat64');
+                  return open(host, header.port);
+                }),
+            ].filter(Boolean);
+            await connectFrom(0);
+          } else if (n) {
+            await sink.write(data);
+          }
+        }
+      }
+      buf = off < buf.length ? buf.slice(off) : new Uint8Array(0);
+    }
+    if (sink) {
+      await sink.close();
+      await downlink;
+    } else {
+      await out.close();
+    }
+  } catch {
+    try {
+      socket?.close();
+    } catch {}
+    try {
+      await out.abort();
+    } catch {}
+  }
+};
 
 export default {
-  async fetch(request) {
-    const uuidBytes = parseUuid(UUID);
-    if (!uuidBytes) return new Response("Invalid UUID configuration", { status: 500 });
-    const url = new URL(request.url);
-    const svc = GRPC_SERVICE_NAME.replace(/^\/+|\/+$/g, "");
-    const tunPath = svc ? `/${svc}/Tun` : "/Tun";
-    const tunMultiPath = svc ? `/${svc}/TunMulti` : "/TunMulti";
-    const contentType = (request.headers.get("content-type") || "").toLowerCase();
-
-    if (
-      request.method === "POST" &&
-      contentType.startsWith("application/grpc") &&
-      (url.pathname === tunPath || url.pathname === tunMultiPath)
-    ) {
-      if (!request.body) return new Response("Bad Request", { status: 400 });
-      return handleGrpc(request, uuidBytes);
+  fetch(request, env, ctx) {
+    const contentType = request.headers.get('content-type') || '';
+    if (request.method !== 'POST' || !request.body || !contentType.startsWith('application/grpc')) {
+      return new Response(null, { status: 404 });
     }
-
-    return new Response("Not Found", { status: 404 });
-  }
+    const { readable, writable } = new TransformStream();
+    ctx.waitUntil(tunnel(request, writable));
+    return new Response(readable, {
+      headers: {
+        'content-type': 'application/grpc',
+        'grpc-status': '0',
+        'x-accel-buffering': 'no',
+        'cache-control': 'no-store',
+      },
+    });
+  },
 };
