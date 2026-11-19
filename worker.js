@@ -43,29 +43,29 @@ const encodeFrame = (data) => {
 };
 
 const parseHeader = (d) => {
-  if (d.length < 22 || d[0] !== 0) return null;
-  for (let i = 0; i < 16; i++) if (d[1 + i] !== USER_ID[i]) return null;
+  if (d.length < 22 || d[0] !== 0) return { err: `bad_ver_or_len:${d.length}:${d[0]}` };
+  for (let i = 0; i < 16; i++) if (d[1 + i] !== USER_ID[i]) return { err: 'uuid_mismatch' };
   let p = 18 + d[17];
-  if (p + 4 > d.length) return null;
+  if (p + 4 > d.length) return { err: 'short_header' };
   const cmd = d[p], port = (d[p + 1] << 8) | d[p + 2], type = d[p + 3];
   p += 4;
   let host;
   if (type === 1) {
-    if (p + 4 > d.length) return null;
+    if (p + 4 > d.length) return { err: 'bad_ipv4' };
     host = d.subarray(p, p + 4).join('.');
     p += 4;
   } else if (type === 2) {
     const len = d[p++];
-    if (!len || p + len > d.length) return null;
+    if (!len || p + len > d.length) return { err: 'bad_domain' };
     host = decoder.decode(d.subarray(p, p + len));
     p += len;
   } else if (type === 3) {
-    if (p + 16 > d.length) return null;
+    if (p + 16 > d.length) return { err: 'bad_ipv6' };
     const g = [];
     for (let i = 0; i < 16; i += 2) g.push(((d[p + i] << 8) | d[p + i + 1]).toString(16));
     host = g.join(':');
     p += 16;
-  } else return null;
+  } else return { err: `bad_addr_type:${type}` };
   return { version: d[0], cmd, port, host, offset: p };
 };
 
@@ -116,7 +116,7 @@ const dialFallback = async (port, fb) => {
     const t = fb.list[fb.i++];
     try { return await open(t.host, t.port); } catch {}
   }
-  throw new Error('fallback failed');
+  throw new Error('fallback_failed');
 };
 
 const tunnel = async (request, writable) => {
@@ -175,22 +175,23 @@ const tunnel = async (request, writable) => {
       buf = buf.length ? concat(buf, value) : value;
       let off = 0;
       while (buf.length - off >= 5) {
-        if (buf[off] !== 0) throw new Error('compressed');
+        if (buf[off] !== 0) throw new Error(`bad_flag:${buf[off]}`);
         const len = new DataView(buf.buffer, buf.byteOffset + off + 1, 4).getUint32(0);
-        if (len > MAX_FRAME) throw new Error('frame too large');
+        if (len > MAX_FRAME) throw new Error(`frame_too_large:${len}`);
         if (buf.length - off < 5 + len) break;
         const msg = buf.subarray(off + 5, off + 5 + len);
         off += 5 + len;
         for (let i = 0; i < msg.length; ) {
-          if (msg[i++] !== 10) throw new Error('bad message');
+          if (msg[i++] !== 10) throw new Error(`bad_proto_tag:${msg[i - 1]}`);
           let n = 0, s = 0, b;
           do { b = msg[i++]; n |= (b & 127) << s; s += 7; } while (b & 128 && s < 28);
-          if (b & 128 || i + n > msg.length) throw new Error('bad message');
+          if (b & 128 || i + n > msg.length) throw new Error('bad_varint');
           const data = msg.subarray(i, i + n);
           i += n;
           if (!sink) {
             const h = parseHeader(data);
-            if (!h || h.cmd !== 1) throw new Error('bad request');
+            if (h.err) throw new Error(h.err);
+            if (h.cmd !== 1) throw new Error(`unsupported_cmd:${h.cmd}`);
             try {
               socket = await open(h.host, h.port);
             } catch (err) {
@@ -214,9 +215,11 @@ const tunnel = async (request, writable) => {
     } else {
       await out.close();
     }
-  } catch {
+  } catch (err) {
+    const e = err instanceof Error ? err : new Error(String(err));
+    console.error('TUNNEL_ERR:', e.message);
     try { socket?.close(); } catch {}
-    try { await out.abort(); } catch {}
+    try { await out.abort(e); } catch {}
   }
 };
 
@@ -232,8 +235,9 @@ export default {
     if (request.method !== 'POST' || !request.body || !ct.startsWith('application/grpc') || !PATHS.has(url.pathname)) {
       return new Response(null, { status: 404 });
     }
+    const respCt = ct.startsWith('application/grpc-web') ? 'application/grpc-web' : 'application/grpc';
     const { readable, writable } = new TransformStream();
     ctx.waitUntil(tunnel(request, writable));
-    return new Response(readable, { headers: { 'content-type': 'application/grpc', 'cache-control': 'no-store' } });
+    return new Response(readable, { headers: { 'content-type': respCt, 'cache-control': 'no-store' } });
   },
 };
