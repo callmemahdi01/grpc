@@ -7,15 +7,6 @@ const TARGET_PORT = 0; // 0 = پورت درخواست کلاینت (برای ا�
 const CONNECT_TIMEOUT_MS = 5000;
 const MAX_FRAME = 1 << 20;
 
-const NGINX_HTML = `<!DOCTYPE html>
-<html><head><title>Welcome to nginx!</title>
-<style>html{color-scheme:light dark}body{width:35em;margin:0 auto;font-family:Tahoma,Verdana,Arial,sans-serif}</style>
-</head><body><h1>Welcome to nginx!</h1>
-<p>If you see this page, the nginx web server is successfully installed and working. Further configuration is required.</p>
-<p>For online documentation and support please refer to <a href="http://nginx.org/">nginx.org</a>.<br/>
-Commercial support is available at <a href="http://nginx.com/">nginx.com</a>.</p>
-<p><em>Thank you for using nginx.</em></p></body></html>`;
-
 const USER_ID = Uint8Array.from(UUID.replace(/-/g, '').match(/../g), (h) => parseInt(h, 16));
 const PATHS = new Set([`/${SERVICE_NAME}/Tun`, `/${SERVICE_NAME}/TunMulti`]);
 const decoder = new TextDecoder();
@@ -222,14 +213,8 @@ const tunnel = async (request, writable) => {
 
 export default {
   fetch(request, env, ctx) {
-    const url = new URL(request.url);
-    if (request.method === 'GET' && url.pathname === '/') {
-      return new Response(NGINX_HTML, {
-        headers: { 'content-type': 'text/html; charset=utf-8' },
-      });
-    }
     const ct = request.headers.get('content-type') || '';
-    if (request.method !== 'POST' || !request.body || !ct.startsWith('application/grpc') || !PATHS.has(url.pathname)) {
+    if (request.method !== 'POST' || !request.body || !ct.startsWith('application/grpc') || !PATHS.has(new URL(request.url).pathname)) {
       return new Response(null, { status: 404 });
     }
     const { readable, writable } = new TransformStream();
