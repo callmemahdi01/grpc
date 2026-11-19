@@ -10,6 +10,7 @@ const EARLY_DATA_MAX_BYTES = 8192;
 const PATH_TUN = `/${SERVICE_NAME}/Tun`;
 const PATH_MULTI = `/${SERVICE_NAME}/TunMulti`;
 const EMPTY = new Uint8Array(0);
+const NEED_MORE = Symbol();
 const HTML = { 'content-type': 'text/html; charset=utf-8' };
 const GRPC = { 'content-type': 'application/grpc', 'cache-control': 'no-store' };
 
@@ -154,16 +155,20 @@ async function* messages(body) {
 }
 
 const parseHeader = (d) => {
-  if (d.length < 20 || d[0] !== 0) return null;
+  if (d.length < 18) return NEED_MORE;
+  if (d[0] !== 0) return null;
   for (let i = 0; i < 16; i++) if (d[1 + i] !== USER_ID[i]) return null;
   const p = 18 + d[17];
+  if (p + 1 > d.length) return NEED_MORE;
   const cmd = d[p];
   if (cmd === 3) return { cmd, offset: p + 1 };
   if (cmd !== 1) return null;
+  if (p + 4 > d.length) return NEED_MORE;
   const type = d[p + 3];
   const addrLen = type === 1 ? 4 : type === 3 ? 16 : type === 2 ? 1 + d[p + 4] : -1;
+  if (addrLen < 0) return null;
   const offset = p + 4 + addrLen;
-  return addrLen < 0 || offset > d.length ? null : { cmd, offset };
+  return offset > d.length ? NEED_MORE : { cmd, offset };
 };
 
 const decodeEarlyData = (request) => {
@@ -215,7 +220,7 @@ const pipeMux = async (socket, id, out, sessions) => {
 
 const openMuxSession = (id, out, sessions) => {
   const socket = openTarget();
-  const sess = { sink: socket.writable.getWriter(), closed: false };
+  const sess = { sink: socket.writable.getWriter() };
   sessions.set(id, sess);
   pipeMux(socket, id, out, sessions);
   return sess;
@@ -244,9 +249,9 @@ const feedMux = (buf, out, sessions) => {
     }
 
     if (status === 1) {
-      sessions.get(id)?.closed === false && sessions.delete(id);
+      sessions.get(id) && sessions.delete(id);
       const sess = openMuxSession(id, out, sessions);
-      if (payload.length) sess.sink.write(payload);
+      if (payload.length) sess.sink.write(payload).catch(() => {});
     } else if (status === 2) {
       const sess = sessions.get(id);
       if (sess && payload.length) sess.sink.write(payload).catch(() => {});
@@ -254,50 +259,51 @@ const feedMux = (buf, out, sessions) => {
       const sess = sessions.get(id);
       if (sess) {
         sessions.delete(id);
-        sess.closed = true;
-        try {
-          sess.sink.close();
-        } catch {}
+        sess.sink.close().catch(() => {});
       }
     }
   }
   return buf.subarray(off);
 };
 
-const tunnel = async (body, out, earlyData, isMux) => {
+const tunnel = async (body, out, earlyData) => {
+  let headerBuf = EMPTY;
+  let header = null;
+  let isMux = false;
   let muxBuf = EMPTY;
   const sessions = new Map();
   let socket;
   let sink;
 
-  try {
-    const iter = messages(body)[Symbol.asyncIterator]();
-    let first = earlyData ? { value: earlyData, done: false } : await iter.next();
-
-    for (;;) {
-      const { value: data, done } = first ?? (await iter.next());
-      first = null;
-      if (done) break;
-      if (!data.length) continue;
-
+  const feed = (data) => {
+    if (!header) {
+      headerBuf = concat(headerBuf, data);
+      const h = parseHeader(headerBuf);
+      if (h === NEED_MORE) return;
+      if (!h) throw new Error('bad request');
+      header = h;
+      isMux = header.cmd === 3;
+      const rest = headerBuf.subarray(header.offset);
+      headerBuf = EMPTY;
       if (isMux) {
-        muxBuf = feedMux(concat(muxBuf, data), out, sessions);
-        continue;
+        if (rest.length) muxBuf = feedMux(rest, out, sessions);
+      } else {
+        socket = openTarget();
+        sink = socket.writable.getWriter();
+        pipeSingle(socket, out);
+        if (rest.length) sink.write(rest);
       }
-
-      if (sink) {
-        sink.write(data);
-        continue;
-      }
-
-      const header = parseHeader(data);
-      if (!header) throw new Error('bad request');
-      socket = openTarget();
-      sink = socket.writable.getWriter();
-      pipeSingle(socket, out);
-      if (data.length > header.offset) sink.write(data.subarray(header.offset));
+      return;
     }
+    if (isMux) muxBuf = feedMux(concat(muxBuf, data), out, sessions);
+    else sink.write(data);
+  };
 
+  try {
+    if (earlyData) feed(earlyData);
+    for await (const data of messages(body)) {
+      if (data.length) feed(data);
+    }
     if (isMux) {
       for (const sess of sessions.values()) sess.sink.close().catch(() => {});
       out.close();
@@ -324,7 +330,7 @@ export default {
         const { readable, writable } = new TransformStream();
         const out = makeWriter(writable.getWriter());
         const earlyData = decodeEarlyData(request);
-        ctx.waitUntil(tunnel(request.body, out, earlyData, pathname === PATH_MULTI));
+        ctx.waitUntil(tunnel(request.body, out, earlyData));
         return new Response(readable, { headers: GRPC });
       }
     }
